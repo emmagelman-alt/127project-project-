@@ -56,6 +56,9 @@ public class ZEDCalibration : MonoBehaviour
     [Header("Capture")]
     [Tooltip("Seconds the person holds still on each point.")]
     public float captureSeconds = 2f;
+    [Tooltip("If the tracked feet wobble more than this (in cm) while someone stands still on a " +
+             "point, the point isn't kept and you're asked to capture it again.")]
+    public float maxWobbleCm = 30f;
     [Tooltip("Size of the rings drawn on the floor, in meters.")]
     public float ringRadius = 0.25f;
     [Tooltip("Width of the rings' lines, in meters.")]
@@ -108,8 +111,15 @@ public class ZEDCalibration : MonoBehaviour
     readonly List<LineRenderer> rings = new List<LineRenderer>();
     readonly List<LineRenderer> dots = new List<LineRenderer>();
     readonly List<LineRenderer> feetMarks = new List<LineRenderer>();
+    readonly List<LineRenderer> liveMarks = new List<LineRenderer>(); // where the camera sees people right now
     Material ringMaterial;
     GUIStyle boxStyle;
+
+    // The ZED's list of the people it is tracking (found by name, so this script doesn't depend on the plugin).
+    MonoBehaviour bodyTracker;
+    System.Reflection.PropertyInfo trackedListProperty;
+    bool usingZEDList;
+    readonly List<Vector3> trackedFeet = new List<Vector3>();
 
     string SavePath => Path.Combine(Application.persistentDataPath, fileName);
 
@@ -127,7 +137,22 @@ public class ZEDCalibration : MonoBehaviour
             return;
         }
         poseAtStart = new Pose(zedRig.position, zedRig.rotation);
+        FindBodyTracker();
         Load();
+    }
+
+    void FindBodyTracker()
+    {
+        foreach (MonoBehaviour mb in FindObjectsByType<MonoBehaviour>(FindObjectsInactive.Exclude))
+        {
+            if (mb.GetType().Name != "ZEDBodyTrackingManager") continue;
+            bodyTracker = mb;
+            trackedListProperty = mb.GetType().GetProperty("AvatarControlList");
+            if (trackedListProperty == null)
+                Debug.LogWarning("[ZED Calibration] The ZED body tracking manager has no AvatarControlList " +
+                                 "(different plugin version?), so every humanoid in the scene counts as a person.", this);
+            return;
+        }
     }
 
     // The ZED moves its camera rig (ZEDManager) inside its parent, and places the tracked
@@ -217,6 +242,7 @@ public class ZEDCalibration : MonoBehaviour
 
         if (Down(K.Escape)) { Cancel(); return; }
 
+        RefreshTrackedPeople();
         switch (mode)
         {
             case Mode.Capturing:
@@ -281,29 +307,58 @@ public class ZEDCalibration : MonoBehaviour
 
     void Sample()
     {
-        int seen = FindFeetNear(points[current].position, out Vector3 feet);
-        if (seen == 0)
+        // Exactly one person may be tracked. Before calibrating, the camera's people show up in
+        // the wrong places, so there's no telling which of several is the one on the ring.
+        if (trackedFeet.Count != 1)
         {
-            sampleWarning = "Nobody is being tracked. Is the person in the camera's view?";
-            return; // wait for them; the clock doesn't run
+            samples.Clear();
+            sampleTime = 0f; // start over once it's down to one person
+            sampleWarning = trackedFeet.Count == 0
+                ? "Waiting: the camera isn't tracking anyone. Is the person in its view?"
+                : $"Paused: the camera is tracking {trackedFeet.Count} people (the pink circles). " +
+                  "Only the person on the ring may be in its view.";
+            return;
         }
-        sampleWarning = seen > 1
-            ? $"The camera sees {seen} people. Using the one closest to the ring; ask the others to step out of view."
-            : "";
+        sampleWarning = "";
 
-        samples.Add(zedRig.InverseTransformPoint(feet));
+        samples.Add(zedRig.InverseTransformPoint(trackedFeet[0]));
         sampleTime += Time.unscaledDeltaTime;
         if (sampleTime < captureSeconds) return;
 
-        Vector3 mean = Vector3.zero;
-        foreach (Vector3 s in samples) mean += s;
-        mean /= samples.Count;
-        float spread = 0f;
-        foreach (Vector3 s in samples) spread = Mathf.Max(spread, Flat(s - mean).magnitude);
+        // The middle of what was seen, ignoring the odd jump, and how much it wobbled.
+        Vector3 middle = Median(samples);
+        float wobbleCm = Wobble(samples, middle) * 100f;
+        if (wobbleCm > maxWobbleCm)
+        {
+            mode = Mode.Capturing;
+            sampleWarning = $"Not kept: the tracked feet wobbled about {wobbleCm:F0} cm while they stood still. " +
+                            "Press Space to try again. If it keeps happening, make sure the camera sees the whole body.";
+            return;
+        }
 
-        captured[current] = mean;
-        spreadCm[current] = spread * 100f;
+        captured[current] = middle;
+        spreadCm[current] = wobbleCm;
         NextPoint();
+    }
+
+    static Vector3 Median(List<Vector3> values)
+    {
+        var xs = values.ConvertAll(v => v.x);
+        var ys = values.ConvertAll(v => v.y);
+        var zs = values.ConvertAll(v => v.z);
+        xs.Sort();
+        ys.Sort();
+        zs.Sort();
+        int m = values.Count / 2;
+        return new Vector3(xs[m], ys[m], zs[m]);
+    }
+
+    // How far the feet strayed from the middle, ignoring the worst 20% (brief tracking glitches).
+    static float Wobble(List<Vector3> values, Vector3 middle)
+    {
+        var d = values.ConvertAll(v => Flat(v - middle).magnitude);
+        d.Sort();
+        return d[Mathf.Clamp(Mathf.CeilToInt(d.Count * 0.8f) - 1, 0, d.Count - 1)];
     }
 
     void NextPoint()
@@ -317,6 +372,7 @@ public class ZEDCalibration : MonoBehaviour
         fit = Solve();
         if (fit.ok) zedRig.SetPositionAndRotation(fit.position, Quaternion.Euler(0f, fit.yaw, 0f));
         mode = Mode.Review;
+        RefreshTrackedPeople(); // so the pink circles jump to the new spots right away
     }
 
     void PreviousPoint()
@@ -370,24 +426,42 @@ public class ZEDCalibration : MonoBehaviour
         return n > 0 ? c / n : zedRig.position;
     }
 
-    // The middle of the feet of the tracked person closest to the given spot.
-    // Returns how many people are being tracked.
-    static int FindFeetNear(Vector3 spot, out Vector3 feet)
+    // The feet of everyone the ZED camera is tracking right now. Only the ZED's own list counts,
+    // so a test character standing in the scene (like the keyboard Player) is ignored.
+    // Without ZED body tracking in the scene (testing on a Mac), every humanoid counts.
+    void RefreshTrackedPeople()
     {
-        feet = Vector3.zero;
-        int seen = 0;
-        float best = float.PositiveInfinity;
-        foreach (Animator anim in FindObjectsByType<Animator>(FindObjectsInactive.Exclude))
+        trackedFeet.Clear();
+        usingZEDList = false;
+        if (bodyTracker && trackedListProperty != null &&
+            trackedListProperty.GetValue(bodyTracker) is System.Collections.IDictionary list)
         {
-            if (!anim.isHuman) continue;
-            Transform l = anim.GetBoneTransform(HumanBodyBones.LeftFoot);
-            Transform r = anim.GetBoneTransform(HumanBodyBones.RightFoot);
-            Vector3 f = l && r ? (l.position + r.position) * 0.5f : l ? l.position : r ? r.position : anim.transform.position;
-            seen++;
-            float d = Flat(f - spot).sqrMagnitude;
-            if (d < best) { best = d; feet = f; }
+            usingZEDList = true;
+            foreach (System.Collections.DictionaryEntry e in list)
+            {
+                Animator anim = AnimatorOf(e.Value);
+                // A newly seen person's avatar stays hidden for a moment before it appears.
+                if (anim && anim.gameObject.activeInHierarchy && anim.isHuman) trackedFeet.Add(FeetOf(anim));
+            }
+            return;
         }
-        return seen;
+        foreach (Animator anim in FindObjectsByType<Animator>(FindObjectsInactive.Exclude))
+            if (anim.isHuman) trackedFeet.Add(FeetOf(anim));
+    }
+
+    static Animator AnimatorOf(object skeletonHandler)
+    {
+        if (skeletonHandler == null) return null;
+        var getAnimator = skeletonHandler.GetType().GetMethod("GetAnimator", Type.EmptyTypes);
+        return getAnimator?.Invoke(skeletonHandler, null) as Animator;
+    }
+
+    // The point between a character's feet.
+    static Vector3 FeetOf(Animator anim)
+    {
+        Transform l = anim.GetBoneTransform(HumanBodyBones.LeftFoot);
+        Transform r = anim.GetBoneTransform(HumanBodyBones.RightFoot);
+        return l && r ? (l.position + r.position) * 0.5f : l ? l.position : r ? r.position : anim.transform.position;
     }
 
     // ----------------------------------------------------------------------------------------
@@ -572,6 +646,19 @@ public class ZEDCalibration : MonoBehaviour
             else
                 feetMarks[i].enabled = false;
         }
+
+        // Pink circles: where the camera sees each person right now. Before calibrating they can be
+        // far from the real person; afterwards they should be right under their feet.
+        float floorY = PointsCenter().y;
+        while (liveMarks.Count < trackedFeet.Count) liveMarks.Add(MakeCircle($"Tracked person {liveMarks.Count + 1}", 24));
+        for (int i = 0; i < liveMarks.Count; i++)
+        {
+            if (i < trackedFeet.Count)
+                PlaceCircle(liveMarks[i], Flat(trackedFeet[i]) + Vector3.up * floorY,
+                            ringRadius * 0.5f, ringWidth, new Color(1f, 0.25f, 0.85f));
+            else
+                liveMarks[i].enabled = false;
+        }
     }
 
     void DestroyRings()
@@ -579,9 +666,11 @@ public class ZEDCalibration : MonoBehaviour
         foreach (LineRenderer lr in rings) if (lr) Destroy(lr.gameObject);
         foreach (LineRenderer lr in dots) if (lr) Destroy(lr.gameObject);
         foreach (LineRenderer lr in feetMarks) if (lr) Destroy(lr.gameObject);
+        foreach (LineRenderer lr in liveMarks) if (lr) Destroy(lr.gameObject);
         rings.Clear();
         dots.Clear();
         feetMarks.Clear();
+        liveMarks.Clear();
         if (ringMaterial) Destroy(ringMaterial);
     }
 
@@ -621,18 +710,26 @@ public class ZEDCalibration : MonoBehaviour
 
             case Mode.Capturing:
                 return $"<b>ZED calibration: point {current + 1} of {points.Count}</b>\n" +
-                       "Have ONE person stand in the middle of the bright ring, facing any way.\n" +
-                       "<b>Space</b> capture    <b>N</b> skip this point    <b>Backspace</b> back    <b>Esc</b> cancel" +
-                       Warning(sampleWarning);
+                       "Have ONE person stand in the middle of the bright ring, facing any way. " +
+                       "Everyone else stays out of the camera's view.\n" +
+                       "<b>Space</b> capture    <b>N</b> skip this point    <b>Backspace</b> back    <b>Esc</b> cancel\n" +
+                       PeopleLine() + Warning(sampleWarning);
 
             case Mode.Sampling:
                 return $"<b>Capturing point {current + 1} of {points.Count}</b>: hold still... " +
-                       $"{Mathf.Clamp01(sampleTime / captureSeconds) * 100f:F0}%" + Warning(sampleWarning);
+                       $"{Mathf.Clamp01(sampleTime / captureSeconds) * 100f:F0}%\n" + PeopleLine() + Warning(sampleWarning);
 
             case Mode.Review:
-                return ReviewText();
+                return ReviewText() + "\n" + PeopleLine();
         }
         return null;
+    }
+
+    string PeopleLine()
+    {
+        string who = trackedFeet.Count == 1 ? "1 person" : $"{trackedFeet.Count} people";
+        string source = usingZEDList ? "The camera is tracking" : "No ZED body tracking found; humanoids in the scene:";
+        return $"{source} <b>{who}</b> (pink circles show where it sees them).";
     }
 
     string ReviewText()
@@ -648,7 +745,7 @@ public class ZEDCalibration : MonoBehaviour
         {
             if (!captured[i].HasValue) { t.Append($"   point {i + 1}: skipped\n"); continue; }
             t.Append($"   point {i + 1}: {ErrorCm(i):F0} cm off");
-            if (spreadCm[i] > 15f) t.Append($"  <color=#ffcc44>(they moved {spreadCm[i]:F0} cm while capturing)</color>");
+            if (spreadCm[i] > 15f) t.Append($"  <color=#ffcc44>(the feet wobbled {spreadCm[i]:F0} cm while capturing)</color>");
             t.Append('\n');
         }
         float rms = CurrentRmsCm();
