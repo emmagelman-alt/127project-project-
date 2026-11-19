@@ -12,6 +12,10 @@ using UnityEngine;
 /// Several people can be held at once: each gets their own root (and word), copied from
 /// Tendril and Label when the game starts, up to Max Roots.
 ///
+/// A booth holds each person by one foot only. Booths share the feet between them: a foot
+/// another booth is holding is skipped, so someone standing between two booths gets one
+/// root on each foot. To add a booth, duplicate the Booth object.
+///
 /// Works on its own for testing: leave Tendril and Label empty and it only
 /// draws the rings and prints what it sees to the Console.
 /// </summary>
@@ -96,9 +100,26 @@ public class BoothRootController : MonoBehaviour
     float nextLook;
     bool warnedAboutTag;
 
+    // Every foot any booth's root is holding, and which booth holds it. Shared by all booths.
+    static readonly Dictionary<Transform, BoothRootController> heldFeet = new Dictionary<Transform, BoothRootController>();
+
+    // Clears the shared list on entering Play mode, even when Unity skips reloading scripts.
+    [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
+    static void ForgetHeldFeet() => heldFeet.Clear();
+
+    bool HeldByAnotherBooth(Transform foot) =>
+        heldFeet.TryGetValue(foot, out BoothRootController booth) && booth && booth != this;
+
     void Start()
     {
         MakeRoots();
+    }
+
+    void OnDisable()
+    {
+        // Let go of everyone, so the other booths can use those feet.
+        foreach (Grip g in grips)
+            if (g.Holding) Release(g);
     }
 
     // The first root is the one set up in the scene; the rest are copies of it, made now while
@@ -178,15 +199,16 @@ public class BoothRootController : MonoBehaviour
         }
     }
 
-    // Everyone inside the grab ring who isn't held yet gets a free root, closest people first.
+    // Everyone inside the grab ring this booth isn't holding yet gets a free root, closest people first.
+    // Each root takes the person's nearest foot that no other booth is holding.
     void GrabNewPeople()
     {
         candidates.Clear();
         foreach (Person p in people)
         {
             if (!Present(p.body) || IsHeld(p.body)) continue;
-            Transform foot = NearestFoot(p, out float distFt);
-            if (!foot) continue;
+            Transform foot = NearestFoot(p, out float distFt, skipFeetOtherBoothsHold: true);
+            if (!foot) continue; // other booths are holding all of this person's feet
 
             // Someone already standing at the booth (for example, the camera only just spotted them)
             // isn't grabbed until they step back out past the release ring.
@@ -212,6 +234,7 @@ public class BoothRootController : MonoBehaviour
 
             g.foot = c.foot;
             g.body = c.body;
+            heldFeet[c.foot] = this;
             Measure(c.foot.position, out Vector3 floorPos, out Vector3 anchor, out _);
             g.tendril.SetEnds(anchor, floorPos);
             g.tendril.Grow();
@@ -239,6 +262,9 @@ public class BoothRootController : MonoBehaviour
         g.tendril.SetPulsing(false);
         g.tendril.Retract(); // stops following the foot and slides back to the ring
         if (g.body) mustStepBack.Add(g.body);
+        // (ReferenceEquals, not "if (g.foot)", so a foot whose character was just deleted is removed too.)
+        if (!ReferenceEquals(g.foot, null) && heldFeet.TryGetValue(g.foot, out BoothRootController owner) && owner == this)
+            heldFeet.Remove(g.foot);
         g.foot = null;
         g.body = null;
         g.state = State.Releasing;
@@ -253,7 +279,7 @@ public class BoothRootController : MonoBehaviour
         if (countHumanoidCharacters)
         {
             foreach (Animator anim in FindObjectsByType<Animator>())
-                if (anim.isHuman) AddPerson(anim.transform, anim);
+                if (anim.isHuman && !rigsAdded.Contains(anim)) AddPerson(anim.transform, anim);
         }
 
         if (countTaggedObjects && !string.IsNullOrEmpty(personTag))
@@ -274,14 +300,17 @@ public class BoothRootController : MonoBehaviour
 
             foreach (GameObject go in tagged)
             {
-                Animator anim = go.GetComponentInChildren<Animator>();
-                if (anim && anim.isHuman)
+                // A tagged part of a humanoid character (the ZED avatar's hip bone is tagged Player),
+                // or a tagged object with a character inside it: that's the character, counted once.
+                Animator anim = HumanoidAround(go.transform);
+                if (anim)
                 {
-                    // A tagged humanoid character: use its rig, and don't count it twice.
                     if (!rigsAdded.Contains(anim)) AddPerson(anim.transform, anim);
                 }
-                else
+                else if (!TaggedParent(go.transform))
                 {
+                    // A plain tagged object, such as a test capsule. A tagged object inside another
+                    // tagged object is part of that one, not a second person.
                     AddPerson(go.transform, null);
                 }
             }
@@ -300,21 +329,45 @@ public class BoothRootController : MonoBehaviour
         people.Add(p);
     }
 
+    // The humanoid character this object belongs to (it or a parent), or one inside it.
+    static Animator HumanoidAround(Transform t)
+    {
+        Animator anim = t.GetComponentInParent<Animator>();
+        if (anim && anim.isHuman) return anim;
+        anim = t.GetComponentInChildren<Animator>();
+        return anim && anim.isHuman ? anim : null;
+    }
+
+    bool TaggedParent(Transform t)
+    {
+        for (Transform p = t.parent; p; p = p.parent)
+            if (p.CompareTag(personTag)) return true;
+        return false;
+    }
+
     // The person's foot closest to the booth (or their position, if they have no feet),
-    // and how far it is from the ring in feet.
-    Transform NearestFoot(Person p, out float distFt)
+    // and how far it is from the ring in feet. When grabbing, feet other booths hold are skipped.
+    Transform NearestFoot(Person p, out float distFt, bool skipFeetOtherBoothsHold = false)
     {
         Transform best = null;
         distFt = float.PositiveInfinity;
-        Consider(p.leftFoot, ref best, ref distFt);
-        Consider(p.rightFoot, ref best, ref distFt);
-        if (!best) Consider(p.body, ref best, ref distFt);
+        bool hasFeet = Present(p.leftFoot) || Present(p.rightFoot);
+        if (hasFeet)
+        {
+            Consider(p.leftFoot, skipFeetOtherBoothsHold, ref best, ref distFt);
+            Consider(p.rightFoot, skipFeetOtherBoothsHold, ref best, ref distFt);
+        }
+        else
+        {
+            Consider(p.body, skipFeetOtherBoothsHold, ref best, ref distFt);
+        }
         return best;
     }
 
-    void Consider(Transform t, ref Transform best, ref float bestFt)
+    void Consider(Transform t, bool skipFeetOtherBoothsHold, ref Transform best, ref float bestFt)
     {
         if (!Present(t)) return;
+        if (skipFeetOtherBoothsHold && HeldByAnotherBooth(t)) return;
         Measure(t.position, out _, out _, out float d);
         if (d < bestFt)
         {
