@@ -102,10 +102,16 @@ public class BoothRootController : MonoBehaviour
 
     // Every foot any booth's root is holding, and which booth holds it. Shared by all booths.
     static readonly Dictionary<Transform, BoothRootController> heldFeet = new Dictionary<Transform, BoothRootController>();
+    // Every root some booth is using, so two booths never steer the same root.
+    static readonly HashSet<RootTendril> rootsInUse = new HashSet<RootTendril>();
 
-    // Clears the shared list on entering Play mode, even when Unity skips reloading scripts.
+    // Clears the shared lists on entering Play mode, even when Unity skips reloading scripts.
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
-    static void ForgetHeldFeet() => heldFeet.Clear();
+    static void ForgetSharedLists()
+    {
+        heldFeet.Clear();
+        rootsInUse.Clear();
+    }
 
     bool HeldByAnotherBooth(Transform foot) =>
         heldFeet.TryGetValue(foot, out BoothRootController booth) && booth && booth != this;
@@ -122,6 +128,11 @@ public class BoothRootController : MonoBehaviour
             if (g.Holding) Release(g);
     }
 
+    void OnDestroy()
+    {
+        foreach (Grip g in grips) rootsInUse.Remove(g.tendril);
+    }
+
     // The first root is the one set up in the scene; the rest are copies of it, made now while
     // every root is still hidden, so each copy starts out clean.
     void MakeRoots()
@@ -129,6 +140,26 @@ public class BoothRootController : MonoBehaviour
         grips.Clear();
         if (!tendril) return;
 
+        // A booth copied without its root and word (say, only the booth model was duplicated)
+        // still points at the first booth's root and word. Then the two booths would pull one
+        // root back and forth between them, so this booth makes its own instead.
+        if (rootsInUse.Contains(tendril))
+        {
+            RootTendril shared = tendril;
+            tendril = Instantiate(shared, shared.transform.parent);
+            tendril.name = $"{shared.name} ({name})";
+            if (label)
+            {
+                RootLabel sharedLabel = label;
+                label = Instantiate(sharedLabel, sharedLabel.transform.parent);
+                label.name = $"{sharedLabel.name} ({name})";
+                label.tendril = tendril;
+            }
+            Debug.Log($"[Booth] \"{name}\" was using another booth's Root and word, so it made its own. " +
+                      "Tip: duplicate the whole Booth object to copy a booth along with its root, word and top.", this);
+        }
+
+        rootsInUse.Add(tendril);
         grips.Add(new Grip { tendril = tendril, label = label });
         for (int i = 2; i <= maxRoots; i++)
         {
@@ -141,6 +172,7 @@ public class BoothRootController : MonoBehaviour
                 copyLabel.name = label.name + " " + i;
                 copyLabel.tendril = copy;
             }
+            rootsInUse.Add(copy);
             grips.Add(new Grip { tendril = copy, label = copyLabel });
         }
     }
