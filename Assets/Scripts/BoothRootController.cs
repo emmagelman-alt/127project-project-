@@ -9,12 +9,13 @@ using UnityEngine;
 ///
 /// When someone steps inside the grab ring, a root grows from the booth to their nearest foot.
 /// It follows them, pulses, shows its word up close, and lets go at the release ring.
-/// The root holds one person at a time: the closest one inside the grab ring.
+/// Several people can be held at once: each gets their own root (and word), copied from
+/// Tendril and Label when the game starts, up to Max Roots.
 ///
 /// Works on its own for testing: leave Tendril and Label empty and it only
 /// draws the rings and prints what it sees to the Console.
 /// </summary>
-[DefaultExecutionOrder(-10)] // run before RootTendril so the root uses this frame's positions
+[DefaultExecutionOrder(-10)] // run before RootTendril so the roots use this frame's positions
 public class BoothRootController : MonoBehaviour
 {
     const float FT = 0.3048f; // feet to meters (1 Unity unit = 1 meter)
@@ -35,26 +36,30 @@ public class BoothRootController : MonoBehaviour
     [Tooltip("The tag for Count Tagged Objects. It must exist under Tags and Layers.")]
     public string personTag = "Player";
     [Tooltip("Seconds between looks for people who arrived or left. " +
-             "The person the root is holding is followed every frame either way.")]
+             "The people the roots are holding are followed every frame either way.")]
     public float lookEverySeconds = 0.25f;
 
-    [Header("Root (leave empty to only test distances)")]
+    [Header("Roots (leave empty to only test distances)")]
+    [Tooltip("The first root. Extra roots for more people are copies of this one.")]
     public RootTendril tendril;
+    [Tooltip("The first root's word. Each extra root gets a copy of it.")]
     public RootLabel label;
+    [Tooltip("The most people the booth can hold at once, each with their own root. 1 = one at a time.")]
+    [Range(1, 12)] public int maxRoots = 6;
 
     [Header("Distances in feet, measured from the ring")]
     public float grabFt = 5f;
     public float revealFt = 4f;
     public float releaseFt = 0.7f;
-    [Tooltip("If the person backs away past this while the root is holding on, it lets go.")]
+    [Tooltip("If a person backs away past this while a root is holding them, it lets go.")]
     public float letGoFt = 5.5f;
-    [Tooltip("After the root lets go of someone, how much farther back than Release Ft they must step " +
-             "before it grabs them again. Keep it above 0 so the root doesn't flicker on and off. " +
+    [Tooltip("After a root lets go of someone, how much farther back than Release Ft they must step " +
+             "before a root grabs them again. Keep it above 0 so the root doesn't flicker on and off. " +
              "Other people can be grabbed right away.")]
     public float reconnectFt = 0.5f;
 
     [Header("Debug")]
-    [Tooltip("Draws a line from the ring to each person (magenta for the one being held) " +
+    [Tooltip("Draws a line from the ring to each person (magenta for people being held) " +
              "and prints how many people it sees to the Console.")]
     public bool showDebug = true;
 
@@ -65,15 +70,59 @@ public class BoothRootController : MonoBehaviour
     }
 
     enum State { Idle, Growing, Attached, Releasing }
-    State state = State.Idle;
+
+    // One root and its word, and who it is holding.
+    class Grip
+    {
+        public RootTendril tendril;
+        public RootLabel label;
+        public State state = State.Idle;
+        public Transform foot; // chosen once, when the root starts growing, so it doesn't jump between feet
+        public Transform body;
+        public bool Holding => state == State.Growing || state == State.Attached;
+    }
+
+    struct Candidate
+    {
+        public Transform foot, body;
+        public float distFt;
+    }
 
     readonly List<Person> people = new List<Person>();
     readonly HashSet<Animator> rigsAdded = new HashSet<Animator>();
+    readonly List<Grip> grips = new List<Grip>();
+    readonly HashSet<Transform> mustStepBack = new HashSet<Transform>(); // people just let go of, until they step back
+    readonly List<Candidate> candidates = new List<Candidate>();
     float nextLook;
-    Transform heldFoot;     // chosen once, when the root starts growing, so it doesn't jump between feet
-    Transform heldBody;
-    Transform releasedBody; // the person just let go of, until they step back
     bool warnedAboutTag;
+
+    void Start()
+    {
+        MakeRoots();
+    }
+
+    // The first root is the one set up in the scene; the rest are copies of it, made now while
+    // every root is still hidden, so each copy starts out clean.
+    void MakeRoots()
+    {
+        grips.Clear();
+        if (!tendril) return;
+
+        grips.Add(new Grip { tendril = tendril, label = label });
+        for (int i = 2; i <= maxRoots; i++)
+        {
+            RootTendril copy = Instantiate(tendril, tendril.transform.parent);
+            copy.name = tendril.name + " " + i;
+            RootLabel copyLabel = null;
+            if (label)
+            {
+                copyLabel = Instantiate(label, label.transform.parent);
+                copyLabel.name = label.name + " " + i;
+                copyLabel.tendril = copy;
+            }
+            grips.Add(new Grip { tendril = copy, label = copyLabel });
+        }
+    }
 
     void Update()
     {
@@ -85,53 +134,57 @@ public class BoothRootController : MonoBehaviour
             nextLook = Time.time + Mathf.Max(0.05f, lookEverySeconds);
         }
 
-        if (tendril) RunRoot();
+        if (tendril)
+        {
+            if (grips.Count == 0) MakeRoots();
+            RunRoots();
+            GrabNewPeople();
+        }
         if (showDebug) ShowDebug();
     }
 
-    void RunRoot()
+    void RunRoots()
     {
-        if (state == State.Idle) TryGrab();
-
-        if (state == State.Growing || state == State.Attached)
+        foreach (Grip g in grips)
         {
-            // The person left the camera's view, so their character disappeared.
-            if (!Present(heldFoot)) { Release(); return; }
-
-            Measure(heldFoot.position, out Vector3 floorPos, out Vector3 anchor, out float distFt);
-            // Both ends pinned every frame, so the root gets shorter on its own as the person walks in.
-            tendril.SetEnds(anchor, floorPos);
-
-            if (state == State.Growing)
+            if (g.Holding)
             {
-                if (distFt > letGoFt) Release();
-                else if (tendril.FullyGrown)
+                // The person left the camera's view, so their character disappeared.
+                if (!Present(g.foot)) { Release(g); continue; }
+
+                Measure(g.foot.position, out Vector3 floorPos, out Vector3 anchor, out float distFt);
+                // Both ends pinned every frame, so the root gets shorter on its own as the person walks in.
+                g.tendril.SetEnds(anchor, floorPos);
+
+                if (g.state == State.Growing)
                 {
-                    tendril.SetPulsing(true);
-                    state = State.Attached;
+                    if (distFt > letGoFt) Release(g);
+                    else if (g.tendril.FullyGrown)
+                    {
+                        g.tendril.SetPulsing(true);
+                        g.state = State.Attached;
+                    }
+                }
+                else
+                {
+                    if (g.label) g.label.SetVisible(distFt <= revealFt);
+                    if (distFt <= releaseFt || distFt > letGoFt) Release(g);
                 }
             }
-            else
+            else if (g.state == State.Releasing && g.tendril.FullyRetracted)
             {
-                if (label) label.SetVisible(distFt <= revealFt);
-                if (distFt <= releaseFt || distFt > letGoFt) Release();
+                g.state = State.Idle;
             }
-        }
-        else if (state == State.Releasing && tendril.FullyRetracted)
-        {
-            state = State.Idle;
         }
     }
 
-    // Grabs the closest person inside the grab ring, if there is one.
-    void TryGrab()
+    // Everyone inside the grab ring who isn't held yet gets a free root, closest people first.
+    void GrabNewPeople()
     {
-        Transform bestFoot = null, bestBody = null;
-        float bestFt = grabFt;
-
+        candidates.Clear();
         foreach (Person p in people)
         {
-            if (!Present(p.body)) continue;
+            if (!Present(p.body) || IsHeld(p.body)) continue;
             Transform foot = NearestFoot(p, out float distFt);
             if (!foot) continue;
 
@@ -139,43 +192,63 @@ public class BoothRootController : MonoBehaviour
             // isn't grabbed until they step back out past the release ring.
             if (distFt <= releaseFt) continue;
 
-            // Whoever the root just let go of has to step back a little before it grabs them again.
-            if (p.body == releasedBody)
+            // Someone a root just let go of has to step back a little before one grabs them again.
+            if (mustStepBack.Contains(p.body))
             {
                 if (distFt <= releaseFt + Mathf.Max(reconnectFt, 0.1f)) continue;
-                releasedBody = null;
+                mustStepBack.Remove(p.body);
             }
 
-            if (distFt <= bestFt)
-            {
-                bestFt = distFt;
-                bestFoot = foot;
-                bestBody = p.body;
-            }
+            if (distFt <= grabFt)
+                candidates.Add(new Candidate { foot = foot, body = p.body, distFt = distFt });
         }
+        if (candidates.Count == 0) return;
+        candidates.Sort((x, y) => x.distFt.CompareTo(y.distFt));
 
-        if (!bestFoot) return;
-        heldFoot = bestFoot;
-        heldBody = bestBody;
-        tendril.Grow();
-        state = State.Growing;
+        foreach (Candidate c in candidates)
+        {
+            Grip g = FreeGrip();
+            if (g == null) break; // every root is busy
+
+            g.foot = c.foot;
+            g.body = c.body;
+            Measure(c.foot.position, out Vector3 floorPos, out Vector3 anchor, out _);
+            g.tendril.SetEnds(anchor, floorPos);
+            g.tendril.Grow();
+            g.state = State.Growing;
+        }
     }
 
-    void Release()
+    Grip FreeGrip()
     {
-        if (label) label.SetVisible(false);
-        tendril.SetPulsing(false);
-        tendril.Retract(); // stops following the foot and slides back to the ring
-        releasedBody = heldBody;
-        heldFoot = null;
-        heldBody = null;
-        state = State.Releasing;
+        foreach (Grip g in grips)
+            if (g.state == State.Idle) return g;
+        return null;
+    }
+
+    bool IsHeld(Transform body)
+    {
+        foreach (Grip g in grips)
+            if (g.Holding && g.body == body) return true;
+        return false;
+    }
+
+    void Release(Grip g)
+    {
+        if (g.label) g.label.SetVisible(false);
+        g.tendril.SetPulsing(false);
+        g.tendril.Retract(); // stops following the foot and slides back to the ring
+        if (g.body) mustStepBack.Add(g.body);
+        g.foot = null;
+        g.body = null;
+        g.state = State.Releasing;
     }
 
     void FindPeople()
     {
         people.Clear();
         rigsAdded.Clear();
+        mustStepBack.RemoveWhere(b => !Present(b)); // forget people who have left
 
         if (countHumanoidCharacters)
         {
@@ -282,15 +355,17 @@ public class BoothRootController : MonoBehaviour
             seen++;
             nearestFt = Mathf.Min(nearestFt, distFt);
             Measure(foot.position, out Vector3 floorPos, out Vector3 anchor, out _);
-            Debug.DrawLine(anchor, floorPos, p.body == heldBody ? Color.magenta : Color.gray);
+            Debug.DrawLine(anchor, floorPos, IsHeld(p.body) ? Color.magenta : Color.gray);
         }
 
         if (Time.frameCount % 15 == 0) // about 4 times a second, so the Console doesn't flood
         {
+            int holding = 0;
+            foreach (Grip g in grips) if (g.Holding) holding++;
             string nearest = seen == 0
                 ? "nobody found"
                 : $"nearest: {nearestFt:F2} ft   zone: {Zone(nearestFt)}";
-            Debug.Log($"[Booth] people: {seen}   {nearest}   state: {state}");
+            Debug.Log($"[Booth] people: {seen}   {nearest}   roots holding: {holding} of {grips.Count}");
         }
     }
 
@@ -303,7 +378,7 @@ public class BoothRootController : MonoBehaviour
 #if UNITY_EDITOR
     // Select the booth to see these rings in the Scene tab.
     // Cyan = where roots start, yellow = grab, green = word, red = let go,
-    // orange = step back past this to make the root grab the same person again.
+    // orange = step back past this to make a root grab the same person again.
     void OnDrawGizmosSelected()
     {
         if (!rootOrigin) return;

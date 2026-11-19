@@ -269,8 +269,21 @@ public class RootTendril : MonoBehaviour
 
     // ---------- Side roots ----------
 
+    const string SideRootName = "Side root ";
+
     void MakeSideRoots()
     {
+        // A copy of a root (the booth makes one per person) arrives with copies of the original's
+        // side roots. Remove those; this root grows its own.
+        for (int c = transform.childCount - 1; c >= 0; c--)
+        {
+            Transform child = transform.GetChild(c);
+            if (!child.name.StartsWith(SideRootName)) continue;
+            LineRenderer old = child.GetComponent<LineRenderer>();
+            if (old) old.enabled = false;
+            Destroy(child.gameObject);
+        }
+
         int count = Mathf.Clamp(sideRoots, 0, 24);
         sides = new SideRoot[count];
         var rng = new System.Random(Mathf.FloorToInt(seed * 1000f));
@@ -280,7 +293,7 @@ public class RootTendril : MonoBehaviour
         float side = R() < 0.5f ? 1f : -1f;
         for (int i = 0; i < count; i++)
         {
-            var go = new GameObject("Side root " + (i + 1));
+            var go = new GameObject(SideRootName + (i + 1));
             go.layer = gameObject.layer;
             go.transform.SetParent(transform, false); // takes the root's flat-on-the-floor rotation
             var lr = go.AddComponent<LineRenderer>();
