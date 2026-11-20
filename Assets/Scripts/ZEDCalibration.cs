@@ -32,7 +32,10 @@ using UnityEngine.InputSystem;
 ///   Line up the projector first: the points are shown on the real floor through it.
 ///   Click the Game view so it gets the keys, then:
 ///     C           start. The points light up as rings on the floor.
-///     Space       with ONE person standing on the bright ring, capture it.
+///                 Hands-free (on by default, for calibrating alone): walk to the bright ring
+///                 before its countdown runs out, hold still while it captures, and it moves on
+///                 to the next ring by itself.
+///     Space       with ONE person standing on the bright ring, capture it now.
 ///                 They hold still for about 2 seconds.
 ///     N           skip this point.        Backspace   redo the previous point.
 ///   After the last point the fix is worked out and applied, and it shows how far off
@@ -63,6 +66,13 @@ public class ZEDCalibration : MonoBehaviour
     public bool matchProjectorScale = true;
 
     [Header("Capture")]
+    [Tooltip("Calibrate alone: after C, each ring captures by itself on a timer, so nobody has to press " +
+             "Space. Walk to the bright ring, stand still while it counts down, then go to the next one.")]
+    public bool handsFree = true;
+    [Tooltip("Hands-free: seconds to walk to each ring before it starts capturing.")]
+    public float walkSeconds = 6f;
+    [Tooltip("Hands-free: extra seconds for the first ring, to get from the keyboard to the floor.")]
+    public float extraSecondsFirstRing = 6f;
     [Tooltip("Seconds the person holds still on each point.")]
     public float captureSeconds = 2f;
     [Tooltip("If the tracked feet wobble more than this (in cm) while someone stands still on a " +
@@ -114,6 +124,8 @@ public class ZEDCalibration : MonoBehaviour
     float[] spreadCm = new float[0];
     readonly List<Vector3> samples = new List<Vector3>();
     float sampleTime;
+    float walkTimeLeft, walkTimeTotal; // hands-free: time left to get to the ring
+    bool retrying;                     // hands-free: the last capture wobbled, so it's trying again
     string sampleWarning = "";
     Fit fit;
 
@@ -129,7 +141,8 @@ public class ZEDCalibration : MonoBehaviour
     readonly List<LineRenderer> feetMarks = new List<LineRenderer>();
     readonly List<LineRenderer> liveMarks = new List<LineRenderer>(); // where the camera sees people right now
     Material ringMaterial;
-    GUIStyle boxStyle;
+    GUIStyle boxStyle, floorStyle;
+    LineRenderer timerArc; // hands-free: shrinks while walking to the ring, fills while holding still
 
     // The ZED's list of the people it is tracking (found by name, so this script doesn't depend on the plugin).
     MonoBehaviour bodyTracker;
@@ -281,6 +294,11 @@ public class ZEDCalibration : MonoBehaviour
                 if (Down(K.Space)) BeginSampling();
                 else if (Down(K.N)) { skipped[current] = true; NextPoint(); }
                 else if (Down(K.Backspace)) PreviousPoint();
+                else if (handsFree)
+                {
+                    walkTimeLeft -= Time.unscaledDeltaTime;
+                    if (walkTimeLeft <= 0f) BeginSampling();
+                }
                 break;
 
             case Mode.Sampling:
@@ -289,7 +307,13 @@ public class ZEDCalibration : MonoBehaviour
 
             case Mode.Review:
                 if (Down(K.Enter)) { Save(); Close(); return; }
-                if (Down(K.Backspace)) { mode = Mode.Capturing; current = LastPointIndex(); captured[current] = null; break; }
+                if (Down(K.Backspace))
+                {
+                    current = LastPointIndex();
+                    captured[current] = null;
+                    GoToPoint(walkSeconds);
+                    break;
+                }
                 Nudge();
                 break;
         }
@@ -316,9 +340,17 @@ public class ZEDCalibration : MonoBehaviour
         current = 0;
         sampleWarning = "";
         fit = default;
-        mode = Mode.Capturing;
+        GoToPoint(walkSeconds + extraSecondsFirstRing);
         startNoteUntil = 0f;
         MakeRings();
+    }
+
+    // Light up the current point's ring and, hands-free, give the person time to get there.
+    void GoToPoint(float secondsToGetThere)
+    {
+        mode = Mode.Capturing;
+        walkTimeTotal = walkTimeLeft = Mathf.Max(secondsToGetThere, 0f);
+        retrying = false;
     }
 
     void Cancel()
@@ -367,9 +399,11 @@ public class ZEDCalibration : MonoBehaviour
         float wobbleCm = Wobble(samples, middle) * 100f;
         if (wobbleCm > maxWobbleCm)
         {
-            mode = Mode.Capturing;
+            GoToPoint(handsFree ? 3f : 0f); // hands-free: try again by itself in a moment
+            retrying = true;
             sampleWarning = $"Not kept: the tracked feet wobbled about {wobbleCm:F0} cm while they stood still. " +
-                            "Press Space to try again. If it keeps happening, make sure the camera sees the whole body.";
+                            (handsFree ? "Trying again: stand still in the ring." : "Press Space to try again.") +
+                            " If it keeps happening, make sure the camera sees the whole body.";
             return;
         }
 
@@ -403,7 +437,7 @@ public class ZEDCalibration : MonoBehaviour
         current++;
         if (current < points.Count)
         {
-            mode = Mode.Capturing;
+            GoToPoint(walkSeconds);
             return;
         }
         fit = Solve();
@@ -422,6 +456,7 @@ public class ZEDCalibration : MonoBehaviour
         current--;
         captured[current] = null;
         skipped[current] = false;
+        GoToPoint(walkSeconds);
     }
 
     int LastPointIndex()
@@ -438,7 +473,7 @@ public class ZEDCalibration : MonoBehaviour
         float turn = Held(K.Shift) ? 2f : 0.25f;    // degrees
 
         Vector3 right = Vector3.right, up = Vector3.forward;
-        Camera cam = Camera.main;
+        Camera cam = ViewCamera();
         if (cam)
         {
             right = Flat(cam.transform.right);
@@ -645,6 +680,26 @@ public class ZEDCalibration : MonoBehaviour
             dots.Add(MakeCircle($"Calibration dot {i + 1}", 24));
             feetMarks.Add(MakeCircle($"Calibration feet {i + 1}", 24));
         }
+        timerArc = MakeCircle("Calibration timer", 65);
+        timerArc.loop = false;
+        timerArc.enabled = false;
+    }
+
+    // Part of a circle, clockwise from the top: 1 = the whole way round.
+    static void PlaceArc(LineRenderer lr, Vector3 center, float radius, float width, Color color, float fraction)
+    {
+        fraction = Mathf.Clamp01(fraction);
+        if (fraction < 0.005f) { lr.enabled = false; return; }
+        lr.enabled = true;
+        lr.startWidth = lr.endWidth = width;
+        lr.startColor = lr.endColor = color;
+        int n = Mathf.Max(2, Mathf.CeilToInt(64 * fraction) + 1);
+        lr.positionCount = n;
+        for (int k = 0; k < n; k++)
+        {
+            float a = Mathf.PI * 0.5f - fraction * Mathf.PI * 2f * k / (n - 1);
+            lr.SetPosition(k, center + new Vector3(Mathf.Cos(a) * radius, 0.02f, Mathf.Sin(a) * radius));
+        }
     }
 
     LineRenderer MakeCircle(string name, int segments)
@@ -705,6 +760,22 @@ public class ZEDCalibration : MonoBehaviour
                 feetMarks[i].enabled = false;
         }
 
+        // Hands-free timer around the bright ring: yellow and shrinking while walking there,
+        // blue and filling up while holding still.
+        if (timerArc)
+        {
+            if (FloorLabel() != null)
+            {
+                bool walking = mode == Mode.Capturing;
+                float fraction = walking
+                    ? (walkTimeTotal > 0f ? walkTimeLeft / walkTimeTotal : 0f)
+                    : sampleTime / Mathf.Max(captureSeconds, 0.01f);
+                PlaceArc(timerArc, points[current].position, ringRadius * 1.5f, ringWidth * 1.8f,
+                         walking ? new Color(1f, 0.85f, 0.1f) : new Color(0.2f, 0.8f, 1f), fraction);
+            }
+            else timerArc.enabled = false;
+        }
+
         // Pink circles: where the camera sees each person right now. Before calibrating they can be
         // far from the real person; afterwards they should be right under their feet.
         float floorY = PointsCenter().y;
@@ -725,6 +796,8 @@ public class ZEDCalibration : MonoBehaviour
         foreach (LineRenderer lr in dots) if (lr) Destroy(lr.gameObject);
         foreach (LineRenderer lr in feetMarks) if (lr) Destroy(lr.gameObject);
         foreach (LineRenderer lr in liveMarks) if (lr) Destroy(lr.gameObject);
+        if (timerArc) Destroy(timerArc.gameObject);
+        timerArc = null;
         rings.Clear();
         dots.Clear();
         feetMarks.Clear();
@@ -757,6 +830,60 @@ public class ZEDCalibration : MonoBehaviour
         float w = Mathf.Min(620f, Screen.width - 20f);
         float h = boxStyle.CalcHeight(new GUIContent(text), w);
         GUI.Box(new Rect(10f, 10f, w, h), text, boxStyle);
+        DrawFloorLabel();
+    }
+
+    // Hands-free: what to show in big letters next to the bright ring, or null for nothing.
+    string FloorLabel()
+    {
+        if (!handsFree || current >= points.Count || !points[current]) return null;
+        if (mode == Mode.Capturing)
+        {
+            int seconds = Mathf.CeilToInt(Mathf.Max(walkTimeLeft, 0f));
+            return retrying ? $"again in {seconds}" : seconds.ToString();
+        }
+        if (mode == Mode.Sampling)
+            return trackedFeet.Count == 1 ? "hold still" : trackedFeet.Count == 0 ? "can't see you" : "only 1 person";
+        return null;
+    }
+
+    // Big enough to read standing on the floor, beside the ring (on the left if there's no room on the right).
+    void DrawFloorLabel()
+    {
+        string text = FloorLabel();
+        Camera cam = ViewCamera();
+        if (text == null || !cam) return;
+
+        Vector3 center = points[current].position;
+        Vector3 sp = cam.WorldToScreenPoint(center);
+        if (sp.z < 0f) return;
+        float gap = Mathf.Abs(cam.WorldToScreenPoint(center + cam.transform.right * ringRadius * ProjectorScale * 1.7f).x - sp.x) + 8f;
+
+        if (floorStyle == null)
+        {
+            floorStyle = new GUIStyle(GUI.skin.label) { fontSize = 56, fontStyle = FontStyle.Bold, wordWrap = false };
+            floorStyle.normal.textColor = Color.white;
+        }
+        const float width = 520f, height = 80f;
+        float y = Screen.height - sp.y - height * 0.5f;
+        bool right = sp.x + gap + width <= Screen.width;
+        floorStyle.alignment = right ? TextAnchor.MiddleLeft : TextAnchor.MiddleRight;
+        var rect = new Rect(right ? sp.x + gap : sp.x - gap - width, y, width, height);
+
+        Color before = GUI.color;
+        GUI.color = new Color(0f, 0f, 0f, 0.85f);
+        GUI.Label(new Rect(rect.x + 3f, rect.y + 3f, width, height), text, floorStyle); // shadow
+        GUI.color = before;
+        GUI.Label(rect, text, floorStyle);
+    }
+
+    // The camera drawing the Game view (what the projector shows): the frontmost one on Display 1.
+    static Camera ViewCamera()
+    {
+        Camera best = null;
+        foreach (Camera c in Camera.allCameras)
+            if (!c.targetTexture && c.targetDisplay == 0 && (!best || c.depth > best.depth)) best = c;
+        return best ? best : Camera.main;
     }
 
     string Instructions()
@@ -767,6 +894,13 @@ public class ZEDCalibration : MonoBehaviour
                 return Time.unscaledTime < startNoteUntil ? startNote : null;
 
             case Mode.Capturing:
+                if (handsFree)
+                    return $"<b>ZED calibration: point {current + 1} of {points.Count}</b> (hands-free)\n" +
+                           "Walk to the bright ring and stand in the middle, facing any way. It starts capturing in " +
+                           $"<b>{Mathf.CeilToInt(Mathf.Max(walkTimeLeft, 0f))} s</b>; then hold still for {captureSeconds:0.#} s " +
+                           "and it moves on to the next ring by itself. Nobody else in the camera's view.\n" +
+                           "<b>Space</b> capture now    <b>N</b> skip this point    <b>Backspace</b> back    <b>Esc</b> cancel\n" +
+                           PeopleLine() + Warning(sampleWarning);
                 return $"<b>ZED calibration: point {current + 1} of {points.Count}</b>\n" +
                        "Have ONE person stand in the middle of the bright ring, facing any way. " +
                        "Everyone else stays out of the camera's view.\n" +
