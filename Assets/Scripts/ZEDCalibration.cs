@@ -15,6 +15,11 @@ using UnityEngine.InputSystem;
 /// Calibration Points: a person stands on each one in the real room, and the ZED rig is
 /// turned and shifted until the feet it sees land on the points.
 ///
+/// It also measures the projector's size. If the projector shows the scene smaller than real
+/// life (say 4 m of scene fits on 1 m of floor), the ZED's measurements are stretched by the
+/// same amount, so a real step matches a step in the picture. Nothing in the scene needs
+/// resizing. (Match Projector Scale; this sets the scale of the object it moves.)
+///
 /// SETUP (once, on any computer)
 ///   1. Make an empty object, call it "ZED Calibration", and add this script.
 ///      Three Calibration Points appear as its children.
@@ -52,6 +57,10 @@ public class ZEDCalibration : MonoBehaviour
     [Tooltip("Also move the ZED's floor up or down to the height of the points, so the tracked " +
              "people stand on the scene's floor.")]
     public bool matchFloorHeight = true;
+    [Tooltip("Also measure how much smaller or bigger the projector shows the scene than real life, and " +
+             "stretch the ZED's measurements by that much, so a step on the real floor is as long as a step " +
+             "in the projected picture. Needs 2 or more points (3 or more to check the result).")]
+    public bool matchProjectorScale = true;
 
     [Header("Capture")]
     [Tooltip("Seconds the person holds still on each point.")]
@@ -59,9 +68,10 @@ public class ZEDCalibration : MonoBehaviour
     [Tooltip("If the tracked feet wobble more than this (in cm) while someone stands still on a " +
              "point, the point isn't kept and you're asked to capture it again.")]
     public float maxWobbleCm = 30f;
-    [Tooltip("Size of the rings drawn on the floor, in meters.")]
+    [Tooltip("Size of the rings drawn on the floor, in meters on the real floor " +
+             "(once the projector's size is known; before the first calibration, in scene meters).")]
     public float ringRadius = 0.25f;
-    [Tooltip("Width of the rings' lines, in meters.")]
+    [Tooltip("Width of the rings' lines, in meters, like Ring Radius.")]
     public float ringWidth = 0.04f;
 
     [Header("Saving")]
@@ -76,6 +86,7 @@ public class ZEDCalibration : MonoBehaviour
     public class SavedCalibration
     {
         public float x, y, z, yaw;
+        public float scale = 1f; // scene meters per real meter (how much the ZED's measurements are stretched)
         public int pointsUsed;
         public float averageErrorCm;
         public string savedAt;
@@ -88,8 +99,11 @@ public class ZEDCalibration : MonoBehaviour
         public bool ok;
         public float yaw;          // degrees around the vertical axis
         public Vector3 position;   // where the ZED rig object goes
-        public float rmsCm;        // average leftover error
+        public float scale;        // scene meters per real meter (1 when the scale isn't matched)
+        public float rmsCm;        // average leftover error, in cm on the real floor
         public float scaleOffPct;  // how much farther apart the points are in the scene than for real
+        public bool scaleLooksWrong;
+        public float rejectedScale;
         public bool looksMirrored;
     }
 
@@ -105,6 +119,8 @@ public class ZEDCalibration : MonoBehaviour
 
     Pose poseBeforeCalibrating;
     Pose poseAtStart;
+    Vector3 scaleBeforeCalibrating = Vector3.one;
+    Vector3 scaleAtStart = Vector3.one;
     string startNote = "";
     float startNoteUntil;
 
@@ -123,6 +139,13 @@ public class ZEDCalibration : MonoBehaviour
 
     string SavePath => Path.Combine(Application.persistentDataPath, fileName);
 
+    // Scene meters per real meter, as the ZED rig is set right now.
+    float ProjectorScale => zedRig ? Mathf.Max(Mathf.Abs(zedRig.lossyScale.x), 0.0001f) : 1f;
+
+    // Stretches the ZED's measurements across the floor only; heights stay real, so people keep
+    // their real height and the ZED still finds the floor.
+    void SetScale(float k) => zedRig.localScale = new Vector3(k, 1f, k);
+
     // ----------------------------------------------------------------------------------------
     // Start: find the rig and load the saved calibration
 
@@ -137,6 +160,7 @@ public class ZEDCalibration : MonoBehaviour
             return;
         }
         poseAtStart = new Pose(zedRig.position, zedRig.rotation);
+        scaleAtStart = zedRig.localScale;
         FindBodyTracker();
         Load();
     }
@@ -185,8 +209,11 @@ public class ZEDCalibration : MonoBehaviour
         {
             SavedCalibration s = JsonUtility.FromJson<SavedCalibration>(File.ReadAllText(path));
             zedRig.SetPositionAndRotation(new Vector3(s.x, s.y, s.z), Quaternion.Euler(0f, s.yaw, 0f));
+            float k = s.scale > 0.01f ? s.scale : 1f;
+            if (matchProjectorScale) SetScale(k);
+            string size = matchProjectorScale && Mathf.Abs(k - 1f) > 0.05f ? $", 1 m of floor = {k:F2} m of scene" : "";
             ShowStartNote($"ZED calibration loaded (saved {s.savedAt}, {s.pointsUsed} points, " +
-                          $"about {s.averageErrorCm:F0} cm off). Press C to calibrate again.");
+                          $"about {s.averageErrorCm:F0} cm off{size}). Press C to calibrate again.");
             Debug.Log($"[ZED Calibration] Loaded from {path}", this);
         }
         catch (Exception e)
@@ -202,6 +229,7 @@ public class ZEDCalibration : MonoBehaviour
         {
             x = p.x, y = p.y, z = p.z,
             yaw = zedRig.eulerAngles.y,
+            scale = ProjectorScale,
             pointsUsed = CapturedCount(),
             averageErrorCm = CurrentRmsCm(),
             savedAt = DateTime.Now.ToString("yyyy-MM-dd HH:mm"),
@@ -221,7 +249,11 @@ public class ZEDCalibration : MonoBehaviour
     void ForgetSaved()
     {
         if (File.Exists(SavePath)) File.Delete(SavePath);
-        if (Application.isPlaying && zedRig) zedRig.SetPositionAndRotation(poseAtStart.position, poseAtStart.rotation);
+        if (Application.isPlaying && zedRig)
+        {
+            zedRig.SetPositionAndRotation(poseAtStart.position, poseAtStart.rotation);
+            zedRig.localScale = scaleAtStart;
+        }
         Debug.Log("[ZED Calibration] Saved calibration deleted.", this);
     }
 
@@ -272,7 +304,11 @@ public class ZEDCalibration : MonoBehaviour
             Debug.LogWarning("[ZED Calibration] Add some Calibration Points first.", this);
             return;
         }
-        if (mode == Mode.Off) poseBeforeCalibrating = new Pose(zedRig.position, zedRig.rotation);
+        if (mode == Mode.Off)
+        {
+            poseBeforeCalibrating = new Pose(zedRig.position, zedRig.rotation);
+            scaleBeforeCalibrating = zedRig.localScale;
+        }
 
         captured = new Vector3?[points.Count];
         skipped = new bool[points.Count];
@@ -288,6 +324,7 @@ public class ZEDCalibration : MonoBehaviour
     void Cancel()
     {
         zedRig.SetPositionAndRotation(poseBeforeCalibrating.position, poseBeforeCalibrating.rotation);
+        zedRig.localScale = scaleBeforeCalibrating;
         Close();
     }
 
@@ -370,7 +407,11 @@ public class ZEDCalibration : MonoBehaviour
             return;
         }
         fit = Solve();
-        if (fit.ok) zedRig.SetPositionAndRotation(fit.position, Quaternion.Euler(0f, fit.yaw, 0f));
+        if (fit.ok)
+        {
+            zedRig.SetPositionAndRotation(fit.position, Quaternion.Euler(0f, fit.yaw, 0f));
+            if (matchProjectorScale) SetScale(fit.scale);
+        }
         mode = Mode.Review;
         RefreshTrackedPeople(); // so the pink circles jump to the new spots right away
     }
@@ -393,7 +434,7 @@ public class ZEDCalibration : MonoBehaviour
     // Small fixes by hand, in screen directions of the camera showing the Game view.
     void Nudge()
     {
-        float step = Held(K.Shift) ? 0.10f : 0.01f; // meters
+        float step = (Held(K.Shift) ? 0.10f : 0.01f) * ProjectorScale; // 1 or 10 cm on the real floor
         float turn = Held(K.Shift) ? 2f : 0.25f;    // degrees
 
         Vector3 right = Vector3.right, up = Vector3.forward;
@@ -483,9 +524,20 @@ public class ZEDCalibration : MonoBehaviour
         if (n == 0) return default;
         floorY /= n;
 
+        bool withScale = matchProjectorScale;
         Fit f = n == 1
-            ? FitShiftOnly(from[0], to[0], zedRig.eulerAngles.y)
-            : FitTurnAndShift(from, to);
+            ? FitShiftOnly(from[0], to[0], zedRig.eulerAngles.y, withScale ? ProjectorScale : 1f)
+            : FitTurnAndShift(from, to, withScale);
+
+        // A size difference this big means the feet weren't on the rings, not a real projector size.
+        if (n >= 2 && withScale && (f.scale < 0.2f || f.scale > 10f))
+        {
+            float measured = f.scale;
+            withScale = false;
+            f = FitTurnAndShift(from, to, false);
+            f.scaleLooksWrong = true;
+            f.rejectedScale = measured;
+        }
 
         f.position.y = matchFloorHeight ? floorY : zedRig.position.y;
 
@@ -493,20 +545,21 @@ public class ZEDCalibration : MonoBehaviour
         {
             // If the points fit much better as a mirror image, the ZED's Mirror Mode is probably on.
             var flipped = from.ConvertAll(p => new Vector2(-p.x, p.y));
-            Fit m = FitTurnAndShift(flipped, to);
+            Fit m = FitTurnAndShift(flipped, to, withScale);
             f.looksMirrored = f.rmsCm > 10f && m.rmsCm < f.rmsCm * 0.5f;
         }
         return f;
     }
 
-    static Fit FitShiftOnly(Vector2 from, Vector2 to, float yaw)
+    static Fit FitShiftOnly(Vector2 from, Vector2 to, float yaw, float scale)
     {
-        Vector2 shift = to - Turn(from, yaw);
-        return new Fit { ok = true, yaw = yaw, position = new Vector3(shift.x, 0f, shift.y) };
+        Vector2 shift = to - Turn(from, yaw) * scale;
+        return new Fit { ok = true, yaw = yaw, scale = scale, position = new Vector3(shift.x, 0f, shift.y) };
     }
 
-    // Best turn around the vertical axis plus a shift on the floor (2D Procrustes / Kabsch).
-    static Fit FitTurnAndShift(List<Vector2> from, List<Vector2> to)
+    // Best turn around the vertical axis plus a shift on the floor (2D Procrustes / Kabsch),
+    // and with withScale, the best stretch too (Umeyama).
+    static Fit FitTurnAndShift(List<Vector2> from, List<Vector2> to, bool withScale)
     {
         int n = from.Count;
         Vector2 cf = Vector2.zero, ct = Vector2.zero;
@@ -525,17 +578,19 @@ public class ZEDCalibration : MonoBehaviour
             spreadTo += b.sqrMagnitude;
         }
         float yaw = Mathf.Atan2(s, c) * Mathf.Rad2Deg;
-        Vector2 shift = ct - Turn(cf, yaw);
+        float k = withScale && spreadFrom > 1e-6f ? Mathf.Sqrt(c * c + s * s) / spreadFrom : 1f;
+        Vector2 shift = ct - Turn(cf, yaw) * k;
 
         float err = 0f;
-        for (int i = 0; i < n; i++) err += (Turn(from[i], yaw) + shift - to[i]).sqrMagnitude;
+        for (int i = 0; i < n; i++) err += (Turn(from[i], yaw) * k + shift - to[i]).sqrMagnitude;
 
         return new Fit
         {
             ok = true,
             yaw = Mathf.Repeat(yaw, 360f),
+            scale = k,
             position = new Vector3(shift.x, 0f, shift.y),
-            rmsCm = Mathf.Sqrt(err / n) * 100f,
+            rmsCm = Mathf.Sqrt(err / n) * 100f / Mathf.Max(k, 0.0001f),
             scaleOffPct = spreadFrom > 0.25f ? (Mathf.Sqrt(spreadTo / spreadFrom) - 1f) * 100f : 0f,
         };
     }
@@ -549,8 +604,9 @@ public class ZEDCalibration : MonoBehaviour
     static Vector2 XZ(Vector3 v) => new Vector2(v.x, v.z);
     static Vector3 Flat(Vector3 v) { v.y = 0f; return v; }
 
-    // Where a captured spot lands with the rig where it is now, and how far that is from its point.
-    float ErrorCm(int i) => Flat(zedRig.TransformPoint(captured[i].Value) - points[i].position).magnitude * 100f;
+    // Where a captured spot lands with the rig where it is now, and how far that is from its point,
+    // in cm on the real floor.
+    float ErrorCm(int i) => Flat(zedRig.TransformPoint(captured[i].Value) - points[i].position).magnitude * 100f / ProjectorScale;
 
     float CurrentRmsCm()
     {
@@ -623,6 +679,8 @@ public class ZEDCalibration : MonoBehaviour
     void UpdateRings()
     {
         float pulse = 0.5f + 0.5f * Mathf.Sin(Time.unscaledTime * 6f);
+        float size = ProjectorScale; // so the rings are Ring Radius wide on the real floor
+        float ringRadius = this.ringRadius * size, ringWidth = this.ringWidth * size;
         for (int i = 0; i < rings.Count && i < points.Count; i++)
         {
             if (!points[i]) continue;
@@ -753,10 +811,21 @@ public class ZEDCalibration : MonoBehaviour
                  (rms <= 10f ? "  (good)" : rms <= 20f ? "  (OK)" : "  <color=#ffcc44>(poor: try again)</color>") + "\n");
 
         if (n == 1) t.Append(Warning("Only 1 point: the position is fixed but the direction isn't. Use 2 or more points."));
-        if (Mathf.Abs(fit.scaleOffPct) > 5f)
+        if (n == 2 && matchProjectorScale)
+            t.Append(Warning("Only 2 points: they always fit exactly, so there's nothing to check the result against. Use 3 or more."));
+
+        if (fit.scaleLooksWrong)
+            t.Append(Warning($"The size difference came out as {fit.rejectedScale:F2}x, which can't be right, " +
+                             "so it wasn't used. Check that the person stood in the middle of each bright ring."));
+        else if (matchProjectorScale && n >= 2 && Mathf.Abs(fit.scale - 1f) > 0.05f)
+            t.Append($"\nSize: 1 m on the real floor = <b>{fit.scale:F2} m</b> in the scene (the projector shows the scene " +
+                     $"{(fit.scale > 1f ? "smaller" : "bigger")} than real life). The camera's measurements are " +
+                     $"{(fit.scale > 1f ? "stretched" : "shrunk")} to match, so nothing in the scene needs resizing.");
+        else if (!matchProjectorScale && Mathf.Abs(fit.scaleOffPct) > 5f)
             t.Append(Warning($"The points are {Mathf.Abs(fit.scaleOffPct):F0}% {(fit.scaleOffPct > 0 ? "farther apart" : "closer together")} " +
                              "in the scene than on the real floor. The projector's picture is probably " +
-                             $"{(fit.scaleOffPct > 0 ? "too small" : "too big")}: fix the projector camera's size, then calibrate again."));
+                             $"{(fit.scaleOffPct > 0 ? "too small" : "too big")}: turn on Match Projector Scale, " +
+                             "or fix the projector camera's size, then calibrate again."));
         if (fit.looksMirrored)
             t.Append(Warning("The points fit much better as a mirror image. Check that Mirror Mode is off " +
                              "on the ZED body tracking manager."));
